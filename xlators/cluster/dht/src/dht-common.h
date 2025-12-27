@@ -379,6 +379,7 @@ struct dht_local {
     gf_boolean_t locked;
     gf_boolean_t dont_create_linkto;
     gf_boolean_t gfid_missing;
+    gf_boolean_t require_stale_linkfile_double_check;
     bool simple_quota;
 };
 typedef struct dht_local dht_local_t;

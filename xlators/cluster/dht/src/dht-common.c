@@ -2160,6 +2160,58 @@ dht_lookup_unlink_stale_linkto_cbk(call_frame_t *frame, void *cookie,
 }
 
 static int
+dht_lookup_do_unlink_stale_linkto(call_frame_t *frame, xlator_t *this) {
+    dht_local_t *local = NULL;
+    xlator_t *hashed_subvol = NULL;
+
+    local = frame->local;
+    hashed_subvol = local->hashed_subvol;
+
+    STACK_WIND(frame, dht_lookup_unlink_stale_linkto_cbk,
+        hashed_subvol, hashed_subvol->fops->unlink,
+        &local->loc, 0, local->xattr_req);
+
+    return 0;
+}
+
+static int
+dht_lookup_stale_linkto_double_check_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
+                                         int32_t op_ret, int32_t op_errno, inode_t *inode,
+                                         struct iatt *buf, dict_t *xattr,
+                                         struct iatt *postparent)
+{
+    dht_local_t *local = frame->local;
+
+    if (op_ret == 0 && op_errno == 0) {
+        if (gf_uuid_compare(local->skip_unlink.hashed_gfid, buf->ia_gfid)) {
+            gf_msg(this->name, GF_LOG_INFO, 0, DHT_MSG_UNLINK_LOOKUP_INFO,
+                   "find file %s on cached subvol %s during double-check with different gfid:"
+                   "hashed_gfid=%s, cached_gfid=%s. Continue original unlink path.",
+                   local->loc.path, this->name, uuid_utoa(local->skip_unlink.hashed_gfid), buf->ia_gfid);
+
+            goto unlink;
+        }
+
+        gf_msg(this->name, GF_LOG_INFO, 0, DHT_MSG_UNLINK_LOOKUP_INFO,
+            "find file %s on cached subvol %s during double-check, so skip unlink stale linkto file",
+            local->loc.path, this->name);
+        /*
+        DHT_STACK_UNWIND(lookup, frame, local->op_ret, local->op_errno,
+                        local->inode, &local->stbuf, local->xattr,
+                         &local->postparent);
+        */
+        //DHT_STACK_UNWIND(lookup, frame, -1, EEXIST, NULL, NULL, NULL, NULL);
+        DHT_STACK_UNWIND(lookup, frame, 0, 0, inode, buf, xattr,
+                         postparent);
+
+        return 0;
+    }
+
+unlink:
+    return dht_lookup_do_unlink_stale_linkto(frame, this);
+}
+
+static int
 dht_fill_dict_to_avoid_unlink_of_migrating_file(dict_t *dict)
 {
     int ret = 0;
@@ -2297,6 +2349,24 @@ err:
     return 0;
 }
 
+static int
+dht_lookup_stale_linkto_double_check(call_frame_t *frame, xlator_t *this) {
+    dht_local_t *local = NULL;
+    xlator_t *may_cached_subvol = NULL;
+
+    local = frame->local;
+    may_cached_subvol = local->skip_unlink.hash_links_to;
+
+    if (!local->require_stale_linkfile_double_check) {
+        return dht_lookup_do_unlink_stale_linkto(frame, this);
+    }
+
+    STACK_WIND(frame, dht_lookup_stale_linkto_double_check_cbk, may_cached_subvol,
+                may_cached_subvol->fops->lookup, &local->loc,
+                local->xattr_req);
+    return 0;
+}
+
 /* Rebalance is performed from cached_node to hashed_node. Initial cached_node
  * contains a non-linkto file. After migration it is converted to linkto and
  * then unlinked. And at hashed_subvolume, first a linkto file is present,
@@ -2431,9 +2501,7 @@ dht_lookup_everywhere_done(call_frame_t *frame, xlator_t *this)
                              local->skip_unlink.opend_fd_count);
                 if (local->skip_unlink.opend_fd_count == 0) {
                     FRAME_SU_DO(frame, dht_local_t);
-                    STACK_WIND(frame, dht_lookup_unlink_stale_linkto_cbk,
-                               hashed_subvol, hashed_subvol->fops->unlink,
-                               &local->loc, 0, local->xattr_req);
+                    dht_lookup_stale_linkto_double_check(frame, this);
                 } else {
                     /* Skip linkfile deletion, this linkfile may be in used
                      * because its fd_count > 0 */
@@ -2803,6 +2871,15 @@ unlock:
                          "everywhere_done",
                          prev->name, loc->path);
 
+            /* local->call_cnt was initially set to conf->subvolume_cnt,
+             * if it is less than conf->subvolume_cnt, it means that
+             * some lookup_every requests have been done.
+             *
+             * In this case, we cannot deeply rely on this result.
+             * set require_stale_linkfile_double_check to true.
+             */
+            if (!fd_count && local->call_cnt < conf->subvolume_cnt)
+                local->require_stale_linkfile_double_check = _gf_true;
         } else if (!ret && (fd_count == 0)) {
             dict_req = dict_new();
 
@@ -2880,6 +2957,7 @@ dht_lookup_everywhere(call_frame_t *frame, xlator_t *this, loc_t *loc)
 
     gf_msg_debug(this->name, 0, "winding lookup call to %d subvols", call_cnt);
 
+    local->require_stale_linkfile_double_check = _gf_false;
     for (i = 0; i < call_cnt; i++) {
         STACK_WIND_COOKIE(frame, dht_lookup_everywhere_cbk, conf->subvolumes[i],
                           conf->subvolumes[i],
